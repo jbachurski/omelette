@@ -1,15 +1,11 @@
-use abomonation_derive::Abomonation;
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::*;
 use differential_dataflow::Collection;
 use serde::{Deserialize, Serialize};
 use sexp::Sexp;
 use std::sync::Arc;
-use timely::dataflow::operators::ToStream;
 
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Abomonation, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct Class(usize);
 
 fn next_class() -> Class {
@@ -18,17 +14,13 @@ fn next_class() -> Class {
     Class(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Abomonation, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct Node {
     term: Term<Class>,
     class: Class,
 }
 
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Abomonation, Serialize, Deserialize,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 enum Term<T> {
     Var(String),
     Lit(i64),
@@ -39,11 +31,11 @@ enum Term<T> {
     Sqrt(T),
 }
 
-fn map_term<S, T>(t: Term<S>, f: &dyn Fn(S) -> T) -> Term<T> {
+fn map_term<S, T>(t: &Term<S>, f: &dyn Fn(&S) -> T) -> Term<T> {
     use Term::*;
     match t {
-        Var(x) => Var(x),
-        Lit(n) => Lit(n),
+        Var(x) => Var(x.clone()),
+        Lit(n) => Lit(*n),
         Add(a, b) => Add(f(a), f(b)),
         Sub(a, b) => Sub(f(a), f(b)),
         Mul(a, b) => Mul(f(a), f(b)),
@@ -52,17 +44,62 @@ fn map_term<S, T>(t: Term<S>, f: &dyn Fn(S) -> T) -> Term<T> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Abomonation, Serialize, Deserialize)]
+fn arity_term<T>(t: &Term<T>) -> usize {
+    use Term::*;
+    match t {
+        Var(_) => 0,
+        Lit(_) => 0,
+        Add(_, _) => 2,
+        Sub(_, _) => 2,
+        Mul(_, _) => 2,
+        Div(_, _) => 2,
+        Sqrt(_) => 1,
+    }
+}
+
+fn get_in_term<T: Clone>(t: &Term<T>, i: usize) -> Option<T> {
+    use Term::*;
+    match (t, i) {
+        (Add(r, _), 0) => Some(r.clone()),
+        (Add(_, r), 1) => Some(r.clone()),
+        (Sub(r, _), 0) => Some(r.clone()),
+        (Sub(_, r), 1) => Some(r.clone()),
+        (Mul(r, _), 0) => Some(r.clone()),
+        (Mul(_, r), 1) => Some(r.clone()),
+        (Div(r, _), 0) => Some(r.clone()),
+        (Div(_, r), 1) => Some(r.clone()),
+        (Sqrt(r), 0) => Some(r.clone()),
+        _ => None,
+    }
+}
+fn set_in_term<T: Clone>(t: &Term<T>, i: usize, n: T) -> Option<Term<T>> {
+    use Term::*;
+    match (t, i) {
+        (Add(_, b), 0) => Some(Add(n, b.clone())),
+        (Add(a, _), 1) => Some(Add(a.clone(), n)),
+        (Sub(_, b), 0) => Some(Sub(n, b.clone())),
+        (Sub(a, _), 1) => Some(Sub(a.clone(), n)),
+        (Mul(_, b), 0) => Some(Mul(n, b.clone())),
+        (Mul(a, _), 1) => Some(Mul(a.clone(), n)),
+        (Div(_, b), 0) => Some(Div(n, b.clone())),
+        (Div(a, _), 1) => Some(Div(a.clone(), n)),
+        (Sqrt(_), 0) => Some(Sqrt(n)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum NewTerm {
     Create(Box<Term<NewTerm>>),
     Leaf(Class),
 }
 
+#[derive(Clone, Debug)]
 struct TTerm(Term<Arc<TTerm>>);
 
 fn to_new_term(t: &TTerm) -> NewTerm {
     let TTerm(t) = t;
-    NewTerm::Create(Box::new(map_term(t.clone(), &|t| to_new_term(&t))))
+    NewTerm::Create(Box::new(map_term(t, &|t| to_new_term(t))))
 }
 
 use std::cell::RefCell;
@@ -78,7 +115,7 @@ fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) ->
     match t {
         NewTerm::Create(t) => {
             // hash consing - only add new class if unseen
-            let tc = map_term(*t.clone(), &|t| collect_created_terms(&t, v));
+            let tc = map_term(t, &|t| collect_created_terms(&t, v));
             let c = SEEN
                 .lock()
                 .unwrap()
@@ -125,10 +162,10 @@ fn sexp_match<'a>(e: &'a Sexp) -> Vec<SubSexpMatch> {
     }
 }
 
-fn term_of_sexp_(e: &Sexp) -> TTerm {
+fn term_of_sexp(e: &Sexp) -> Arc<TTerm> {
     use SubSexpMatch::*;
     use Term::*;
-    match sexp_match(&e).as_slice() {
+    Arc::new(match sexp_match(&e).as_slice() {
         [S("."), I(n)] => TTerm(Lit(*n)),
         [S("!"), S(x)] => TTerm(Var(x.to_string())),
         [S("+"), T(a), T(b)] => TTerm(Add(term_of_sexp(a), term_of_sexp(b))),
@@ -137,11 +174,7 @@ fn term_of_sexp_(e: &Sexp) -> TTerm {
         [S("/"), T(a), T(b)] => TTerm(Div(term_of_sexp(a), term_of_sexp(b))),
         [S("sqrt"), T(a)] => TTerm(Sqrt(term_of_sexp(a))),
         _ => panic!("cannot read term from sexp {}", e),
-    }
-}
-
-fn term_of_sexp(s: &Sexp) -> Arc<TTerm> {
-    Arc::new(term_of_sexp_(s))
+    })
 }
 
 fn sexp_of_term(t: &TTerm) -> Sexp {
@@ -160,7 +193,7 @@ fn sexp_of_term(t: &TTerm) -> Sexp {
 }
 
 fn read_term(s: &str) -> TTerm {
-    term_of_sexp_(&sexp::parse(s).unwrap())
+    (*term_of_sexp(&sexp::parse(s).unwrap())).clone()
 }
 
 #[test]
@@ -184,10 +217,9 @@ fn main() {
             let final_nodes: Collection<_, Node> = init_terms
                 .map(|(term, class)| Node { term, class })
                 .iterate(|nodes: &Collection<_, Node>| {
-                    // let norm = nodes
-                    //     .map(|n| (n.term, n.class))
-                    //     .reduce(|_, input, output| for (t, cs) in input {});
+                    // nodes.inspect(|x| println!("{:?}", x));
 
+                    // e-matching
                     let adds = nodes.filter(|n| match n.term {
                         Add(_, _) => true,
                         _ => false,
@@ -229,29 +261,100 @@ fn main() {
                         )
                     });
 
-                    let _rewrites = comm_rewrites
+                    // collect rewrites, expand e-graph
+                    let rewrites = comm_rewrites
                         .concat(&assoc_rewrites)
-                        .map(|(c, n)| created_terms(&n, Some(c)))
-                        .inspect(|x| println!("{:?}", x))
+                        .map(|(c, n)| created_terms(&n, Some(c)));
+
+                    let new_nodes = rewrites
                         .flat_map(|x| x)
                         .map(|(t, c)| Node { term: t, class: c });
 
+                    let nodes = nodes.concat(&new_nodes).distinct();
+
+                    // collapse e-classes
+                    let repr = nodes
+                        .map(|n| (n.term, n.class))
+                        .reduce(|_key, input, output| {
+                            let r = *input[0].0;
+                            for (x, _) in input {
+                                output.push(((**x, r), 1));
+                            }
+                        })
+                        .map(|(_witness, edge)| edge)
+                        .iterate(|repr| {
+                            repr.map(|(child, parent)| (parent, child))
+                                .join_map(repr, |_parent, child, grandparent| {
+                                    (*child, *grandparent)
+                                })
+                                .distinct()
+                        });
+                    // .inspect(|x| println!("collapsed {:?}", x));
+
+                    // rebuild e-graph
+
+                    // - update term classes
+                    let nodes = nodes
+                        .map(|n| (n.class, n))
+                        .join_map(&repr, |_, n, c| Node {
+                            term: n.term.clone(),
+                            class: *c,
+                        })
+                        .distinct();
+
+                    // - update subterm classes: nodes must be a set at this point!
+                    let updates = nodes
+                        .flat_map(|n| {
+                            (0..arity_term(&n.term))
+                                .map(move |i| (get_in_term(&n.term, i).unwrap(), (n.clone(), i)))
+                        })
+                        .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
+                        .reduce(|n, input, output| {
+                            let mut t = n.term.clone();
+                            for ((i, c), _) in input {
+                                t = set_in_term(&t, *i, *c).unwrap();
+                            }
+                            output.push((
+                                Node {
+                                    term: t,
+                                    class: n.class,
+                                },
+                                1,
+                            ))
+                        });
+
+                    let nodes = nodes
+                        .concat(&updates.map(|(_old, new)| new))
+                        .concat(&updates.map(|(old, _new)| old).negate());
+
                     nodes.distinct()
                 });
-            println!("saturated");
-            let _ = final_nodes.inspect(|x| println!("{:?}", x));
+            // println!("saturated");
+            let _ = final_nodes.inspect(|x| println!("final: {:?}", x));
 
             return init_terms_input;
         });
 
         inits.advance_to(0);
-        let terms_for_init = created_terms(
+        for (t, c) in created_terms(
             &to_new_term(&read_term(
-                "(+ (+ (+ (. 7) (. 3)) (+ (. 4) (. 5))) (+ (. 1) (+ (. 2) (. 6))))",
+                // "(+ (. 1) (. 2))",
+                "(+ (+ (. 1) (. 2)) (. 3))",
+                // "(+ (+ (+ (. 7) (. 3)) (+ (. 4) (. 5))) (+ (. 1) (+ (. 2) (. 6))))",
             )),
             None,
-        );
-        for (t, c) in terms_for_init {
+        ) {
+            inits.insert((t, c));
+        }
+
+        for (t, c) in created_terms(
+            &to_new_term(&read_term(
+                // "(+ (. 2) (. 1))",
+                "(+ (+ (. 3) (. 2)) (. 1))",
+                // "(+ (. 1) (+ (. 2) (+ (. 3) (+ (. 4) (+ (. 5) (+ (. 6) (+ (. 7) (. 8))))))))",
+            )),
+            None,
+        ) {
             inits.insert((t, c));
         }
     })
