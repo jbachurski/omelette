@@ -6,6 +6,7 @@ use differential_dataflow::input::Input;
 use differential_dataflow::operators::*;
 use differential_dataflow::Collection;
 use serde::{Deserialize, Serialize};
+use timely::dataflow::operators::capture::{Capture, Extract};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct Class(usize);
@@ -34,6 +35,7 @@ fn to_new_term(t: &TTerm) -> NewTerm {
 }
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) -> Class {
     use once_cell::sync::Lazy;
@@ -72,6 +74,10 @@ fn created_terms(t: &NewTerm, par: Option<Class>) -> Vec<(Term<Class>, Class)> {
 fn main() {
     use NewTerm::*;
     use Term::*;
+
+    let timer = std::time::Instant::now();
+    let (send, recv) = std::sync::mpsc::channel();
+    let send = std::sync::Arc::new(std::sync::Mutex::new(send));
 
     timely::execute_from_args(std::env::args(), move |worker| {
         let mut inits = worker.dataflow(|scope| {
@@ -155,14 +161,14 @@ fn main() {
                     // collect rewrites, expand e-graph
                     let rewrites = comm_rewrites
                         .concat(&assoc_rl_rewrites)
-                        .concat(&assoc_lr_rewrites)
-                        .map(|(c, n)| created_terms(&n, Some(c)));
+                        .concat(&assoc_lr_rewrites);
 
                     let new_nodes = rewrites
+                        .map(|(c, n)| created_terms(&n, Some(c)))
                         .flat_map(|x| x)
                         .map(|(t, c)| Node { term: t, class: c });
 
-                    let nodes = nodes.concat(&new_nodes).distinct();
+                    let nodes = nodes.concat(&new_nodes).distinct().consolidate();
 
                     // collapse e-classes
                     let repr = nodes
@@ -224,31 +230,45 @@ fn main() {
             // println!("saturated");
             // let _ = final_nodes.inspect(|x| println!("final: {:?}", x));
 
+            let send = send.lock().unwrap().clone();
+            final_nodes.consolidate().inner.capture_into(send);
+
             return init_terms_input;
         });
 
+        println!("{:?}\tdefined", timer.elapsed());
+
         inits.advance_to(0);
+
         for (t, c) in created_terms(
             &to_new_term(&read_term(
-                // "(+ (. 1) (. 2))",
-                // "(+ (+ (. 1) (. 2)) (. 3))",
-                "(+ (+ (+ (. 7) (. 3)) (+ (. 4) (+ (. 5) (. 8)))) (+ (. 1) (+ (. 2) (. 6))))",
+                &std::env::args()
+                    .nth(1)
+                    .unwrap_or("(+ (+ (. 1) (. 2)) (. 3))".to_string()),
             )),
             None,
         ) {
             inits.insert((t, c));
         }
 
-        for (t, c) in created_terms(
-            &to_new_term(&read_term(
-                // "(+ (. 2) (. 1))",
-                // "(+ (+ (. 3) (. 2)) (. 1))",
-                "(+ (. 1) (+ (. 2) (+ (. 3) (+ (. 4) (+ (. 5) (+ (. 6) (+ (. 7) (. 8))))))))",
-            )),
-            None,
-        ) {
-            inits.insert((t, c));
-        }
+        println!("{:?}\tgiven", timer.elapsed());
     })
     .expect("Computation terminated abnormally");
+
+    let nodes: Vec<Node> = recv
+        .extract()
+        .into_iter()
+        .flat_map(|(t, c)| {
+            println!("time {}", t);
+            c.into_iter().map(|(node, _, cnt)| {
+                assert!(cnt == 1);
+                println!("{:?}", node);
+                node
+            })
+        })
+        .collect();
+    let classes: HashSet<Class> = nodes.iter().map(|n| n.class).collect();
+
+    println!("{} classes, {} nodes", classes.len(), nodes.len());
+    println!("{:?}\tdone", timer.elapsed());
 }
