@@ -90,7 +90,7 @@ fn main() {
                         _ => false,
                     });
 
-                    let assoc_rewrites = adds
+                    let assoc_rl_rewrites = adds
                         .map(|abc| {
                             (
                                 match abc.term {
@@ -116,6 +116,32 @@ fn main() {
                             )
                         });
 
+                    let assoc_lr_rewrites = adds
+                        .map(|abc| {
+                            (
+                                match abc.term {
+                                    Add(ab, _) => ab,
+                                    _ => panic!(),
+                                },
+                                abc.clone(),
+                            )
+                        })
+                        .join_map(&adds.map(|n| (n.class, n)), |_, abc, ab| {
+                            (
+                                abc.class,
+                                match abc.term {
+                                    Add(_, c) => match ab.term {
+                                        Add(a, b) => Create(Box::new(Add(
+                                            Leaf(a),
+                                            Create(Box::new(Add(Leaf(b), Leaf(c)))),
+                                        ))),
+                                        _ => panic!(),
+                                    },
+                                    _ => panic!(),
+                                },
+                            )
+                        });
+
                     let comm_rewrites = adds.map(|n| {
                         (
                             n.class,
@@ -128,7 +154,8 @@ fn main() {
 
                     // collect rewrites, expand e-graph
                     let rewrites = comm_rewrites
-                        .concat(&assoc_rewrites)
+                        .concat(&assoc_rl_rewrites)
+                        .concat(&assoc_lr_rewrites)
                         .map(|(c, n)| created_terms(&n, Some(c)));
 
                     let new_nodes = rewrites
