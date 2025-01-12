@@ -8,13 +8,7 @@ use differential_dataflow::Collection;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-struct Class(usize);
-
-fn next_class() -> Class {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(1);
-    Class(COUNTER.fetch_add(1, Ordering::Relaxed))
-}
+struct Class(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 struct Node {
@@ -34,25 +28,35 @@ fn to_new_term(t: &TTerm) -> NewTerm {
 }
 
 use std::cell::RefCell;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
+
+#[derive(Hash)]
+struct CTerm(Term<Class>);
+
+fn hash_cterm(t: &Term<Class>) -> Class {
+    use Term::*;
+    let mut state = DefaultHasher::new();
+    CTerm(t.clone()).hash(&mut state);
+    Class(state.finish())
+}
+
+// hash cons table
+use once_cell::sync::Lazy;
+use std::{collections::HashMap, sync::Mutex};
+static SEEN: Lazy<Mutex<HashMap<Class, Class>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn see_norm(c: Class) -> Class {
+    *SEEN.lock().unwrap().get(&c).unwrap_or(&c)
+}
 
 fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) -> Class {
-    use once_cell::sync::Lazy;
-    use std::{collections::HashMap, sync::Mutex};
-
-    // hash cons table
-    static SEEN: Lazy<Mutex<HashMap<Term<Class>, Class>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
-
     match t {
         NewTerm::Create(t) => {
             // hash consing - only add new class if unseen
-            let tc = map_term(t, &|t| collect_created_terms(&t, v));
-            let c = SEEN
-                .lock()
-                .unwrap()
-                .entry(tc.clone())
-                .or_insert_with(|| next_class())
-                .clone();
+            let tc = map_term(t, &|t| see_norm(collect_created_terms(&t, v)));
+            let c = see_norm(hash_cterm(&tc));
             v.borrow_mut().push((tc, c));
             c
         }
@@ -90,7 +94,7 @@ fn main() {
                         _ => false,
                     });
 
-                    let assoc_rewrites = adds
+                    let assoc_rl_rewrites = adds
                         .map(|abc| {
                             (
                                 match abc.term {
@@ -116,6 +120,32 @@ fn main() {
                             )
                         });
 
+                    let assoc_lr_rewrites = adds
+                        .map(|abc| {
+                            (
+                                match abc.term {
+                                    Add(ab, _) => ab,
+                                    _ => panic!(),
+                                },
+                                abc.clone(),
+                            )
+                        })
+                        .join_map(&adds.map(|n| (n.class, n)), |_, abc, ab| {
+                            (
+                                abc.class,
+                                match abc.term {
+                                    Add(_, c) => match ab.term {
+                                        Add(a, b) => Create(Box::new(Add(
+                                            Leaf(a),
+                                            Create(Box::new(Add(Leaf(b), Leaf(c)))),
+                                        ))),
+                                        _ => panic!(),
+                                    },
+                                    _ => panic!(),
+                                },
+                            )
+                        });
+
                     let comm_rewrites = adds.map(|n| {
                         (
                             n.class,
@@ -128,7 +158,8 @@ fn main() {
 
                     // collect rewrites, expand e-graph
                     let rewrites = comm_rewrites
-                        .concat(&assoc_rewrites)
+                        .concat(&assoc_rl_rewrites)
+                        .concat(&assoc_lr_rewrites)
                         .map(|(c, n)| created_terms(&n, Some(c)));
 
                     let new_nodes = rewrites
@@ -138,79 +169,90 @@ fn main() {
                     let nodes = nodes.concat(&new_nodes).distinct();
 
                     // collapse e-classes
-                    let repr = nodes
-                        .map(|n| (n.term, n.class))
-                        .reduce(|_key, input, output| {
-                            let r = *input[0].0;
-                            for (x, _) in input {
-                                output.push(((**x, r), 1));
-                            }
-                        })
-                        .map(|(_witness, edge)| edge)
-                        .iterate(|repr| {
-                            repr.map(|(child, parent)| (parent, child))
-                                .join_map(repr, |_parent, child, grandparent| {
-                                    (*child, *grandparent)
+                    let nodes = nodes.iterate(|nodes| {
+                        let repr = nodes
+                            .map(|n| (n.term, n.class))
+                            .reduce(|_key, input, output| {
+                                let r = *input[0].0;
+                                for (x, _) in input {
+                                    output.push(((**x, r), 1));
+                                }
+                            })
+                            .map(|(_witness, edge)| edge)
+                            .iterate(|repr| {
+                                repr.map(|(child, parent)| (parent, child))
+                                    .join_map(repr, |_parent, child, grandparent| {
+                                        (*child, *grandparent)
+                                    })
+                                    .distinct()
+                            })
+                            .inspect(|((c, p), _, diff)| {
+                                if *diff > 0 {
+                                    SEEN.lock().unwrap().entry(c.clone()).insert_entry(*p);
+                                }
+                            });
+                        // .inspect(|x| println!("collapsed {:?}", x));
+
+                        // rebuild e-graph
+
+                        // - update term classes
+                        let nodes = nodes
+                            .map(|n| (n.class, n))
+                            .join_map(&repr, |_, n, c| Node {
+                                term: n.term.clone(),
+                                class: *c,
+                            })
+                            .distinct();
+
+                        // - update subterm classes: nodes must be a set at this point!
+                        let updates = nodes
+                            .flat_map(|n| {
+                                (0..arity_term(&n.term)).map(move |i| {
+                                    (get_in_term(&n.term, i).unwrap(), (n.clone(), i))
                                 })
-                                .distinct()
-                        });
-                    // .inspect(|x| println!("collapsed {:?}", x));
+                            })
+                            .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
+                            .reduce(|n, input, output| {
+                                let mut t = n.term.clone();
+                                for ((i, c), _) in input {
+                                    t = set_in_term(&t, *i, *c).unwrap();
+                                }
+                                output.push((
+                                    Node {
+                                        term: t,
+                                        class: n.class,
+                                    },
+                                    1,
+                                ))
+                            });
 
-                    // rebuild e-graph
+                        let nodes = nodes
+                            .concat(&updates.map(|(_old, new)| new))
+                            .concat(&updates.map(|(old, _new)| old).negate());
 
-                    // - update term classes
-                    let nodes = nodes
-                        .map(|n| (n.class, n))
-                        .join_map(&repr, |_, n, c| Node {
-                            term: n.term.clone(),
-                            class: *c,
-                        })
-                        .distinct();
+                        nodes.distinct()
+                    });
 
-                    // - update subterm classes: nodes must be a set at this point!
-                    let updates = nodes
-                        .flat_map(|n| {
-                            (0..arity_term(&n.term))
-                                .map(move |i| (get_in_term(&n.term, i).unwrap(), (n.clone(), i)))
-                        })
-                        .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
-                        .reduce(|n, input, output| {
-                            let mut t = n.term.clone();
-                            for ((i, c), _) in input {
-                                t = set_in_term(&t, *i, *c).unwrap();
-                            }
-                            output.push((
-                                Node {
-                                    term: t,
-                                    class: n.class,
-                                },
-                                1,
-                            ))
-                        });
-
-                    let nodes = nodes
-                        .concat(&updates.map(|(_old, new)| new))
-                        .concat(&updates.map(|(old, _new)| old).negate());
-
-                    nodes.distinct()
+                    nodes
                 });
             // println!("saturated");
-            // let _ = final_nodes.inspect(|x| println!("final: {:?}", x));
+            let _ = final_nodes.inspect(|x| println!("final: {:?}", x));
 
             return init_terms_input;
         });
 
         inits.advance_to(0);
-        for (t, c) in created_terms(
-            &to_new_term(&read_term(
-                // "(+ (. 1) (. 2))",
-                // "(+ (+ (. 1) (. 2)) (. 3))",
-                "(+ (+ (+ (. 7) (. 3)) (+ (. 4) (+ (. 5) (. 8)))) (+ (. 1) (+ (. 2) (. 6))))",
-            )),
-            None,
-        ) {
-            inits.insert((t, c));
-        }
+
+        // for (t, c) in created_terms(
+        //     &to_new_term(&read_term(
+        //         // "(+ (. 1) (. 2))",
+        //         // "(+ (+ (. 1) (. 2)) (. 3))",
+        //         // "(+ (+ (+ (. 7) (. 3)) (+ (. 4) (+ (. 5) (. 8)))) (+ (. 1) (+ (. 2) (. 6))))",
+        //     )),
+        //     None,
+        // ) {
+        //     inits.insert((t, c));
+        // }
 
         for (t, c) in created_terms(
             &to_new_term(&read_term(
