@@ -35,6 +35,7 @@ fn to_new_term(t: &TTerm) -> NewTerm {
 }
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) -> Class {
@@ -168,67 +169,68 @@ fn main() {
                         .flat_map(|x| x)
                         .map(|(t, c)| Node { term: t, class: c });
 
-                    let nodes = nodes.concat(&new_nodes).distinct().consolidate();
+                    let nodes = nodes.concat(&new_nodes).distinct();
 
-                    // collapse e-classes
-                    let repr = nodes
-                        .map(|n| (n.term, n.class))
-                        .reduce(|_key, input, output| {
-                            let r = *input[0].0;
-                            for (x, _) in input {
-                                output.push(((**x, r), 1));
-                            }
-                        })
-                        .map(|(_witness, edge)| edge)
-                        .iterate(|repr| {
-                            repr.map(|(child, parent)| (parent, child))
-                                .join_map(repr, |_parent, child, grandparent| {
-                                    (*child, *grandparent)
+                    nodes.iterate(|nodes| {
+                        // collapse e-classes
+                        let repr = nodes
+                            .map(|n| (n.term, n.class))
+                            .reduce(|_key, input, output| {
+                                let r = *input[0].0;
+                                for (x, _) in input {
+                                    output.push(((**x, r), 1));
+                                }
+                            })
+                            .map(|(_witness, edge)| edge)
+                            .iterate(|repr| {
+                                repr.map(|(child, parent)| (parent, child))
+                                    .join_map(repr, |_parent, child, grandparent| {
+                                        (*child, *grandparent)
+                                    })
+                                    .distinct()
+                            });
+                        // .inspect(|x| println!("collapsed {:?}", x));
+
+                        // rebuild e-graph
+
+                        // - update term classes
+                        let nodes = nodes
+                            .map(|n| (n.class, n))
+                            .join_map(&repr, |_, n, c| Node {
+                                term: n.term.clone(),
+                                class: *c,
+                            })
+                            .distinct();
+
+                        // - update subterm classes: nodes must be a set at this point!
+                        let updates = nodes
+                            .flat_map(|n| {
+                                (0..arity_term(&n.term)).map(move |i| {
+                                    (get_in_term(&n.term, i).unwrap(), (n.clone(), i))
                                 })
-                                .distinct()
-                        });
-                    // .inspect(|x| println!("collapsed {:?}", x));
+                            })
+                            .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
+                            .reduce(|n, input, output| {
+                                let mut t = n.term.clone();
+                                for ((i, c), _) in input {
+                                    t = set_in_term(&t, *i, *c).unwrap();
+                                }
+                                output.push((
+                                    Node {
+                                        term: t,
+                                        class: n.class,
+                                    },
+                                    1,
+                                ))
+                            });
 
-                    // rebuild e-graph
+                        let nodes = nodes
+                            .concat(&updates.map(|(_old, new)| new))
+                            .concat(&updates.map(|(old, _new)| old).negate());
 
-                    // - update term classes
-                    let nodes = nodes
-                        .map(|n| (n.class, n))
-                        .join_map(&repr, |_, n, c| Node {
-                            term: n.term.clone(),
-                            class: *c,
-                        })
-                        .distinct();
-
-                    // - update subterm classes: nodes must be a set at this point!
-                    let updates = nodes
-                        .flat_map(|n| {
-                            (0..arity_term(&n.term))
-                                .map(move |i| (get_in_term(&n.term, i).unwrap(), (n.clone(), i)))
-                        })
-                        .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
-                        .reduce(|n, input, output| {
-                            let mut t = n.term.clone();
-                            for ((i, c), _) in input {
-                                t = set_in_term(&t, *i, *c).unwrap();
-                            }
-                            output.push((
-                                Node {
-                                    term: t,
-                                    class: n.class,
-                                },
-                                1,
-                            ))
-                        });
-
-                    let nodes = nodes
-                        .concat(&updates.map(|(_old, new)| new))
-                        .concat(&updates.map(|(old, _new)| old).negate());
-
-                    nodes.distinct()
+                        nodes.distinct()
+                    })
                 });
-            // println!("saturated");
-            // let _ = final_nodes.inspect(|x| println!("final: {:?}", x));
 
             let send = send.lock().unwrap().clone();
             final_nodes.consolidate().inner.capture_into(send);
