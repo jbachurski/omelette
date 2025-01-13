@@ -2,6 +2,7 @@ pub mod term;
 pub mod term_sexp;
 use crate::term::*;
 use crate::term_sexp::*;
+use arrange::ArrangeByKey;
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::*;
 use differential_dataflow::Collection;
@@ -23,7 +24,7 @@ struct Node {
     class: Class,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 enum NewTerm {
     Create(Box<Term<NewTerm>>),
     Leaf(Class),
@@ -34,18 +35,15 @@ fn to_new_term(t: &TTerm) -> NewTerm {
     NewTerm::Create(Box::new(map_term(t, &|t| to_new_term(t))))
 }
 
+use once_cell::sync::Lazy;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+// hash cons table
+static SEEN: Lazy<Mutex<HashMap<Term<Class>, Class>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) -> Class {
-    use once_cell::sync::Lazy;
-    use std::{collections::HashMap, sync::Mutex};
-
-    // hash cons table
-    static SEEN: Lazy<Mutex<HashMap<Term<Class>, Class>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
-
     match t {
         NewTerm::Create(t) => {
             // hash consing - only add new class if unseen
@@ -90,6 +88,13 @@ fn main() {
                 .map(|(term, class)| Node { term, class })
                 .iterate(|nodes: &Collection<_, Node>| {
                     // nodes.inspect(|x| println!("{:?}", x));
+
+                    nodes.consolidate().inspect(|(n, _, _)| {
+                        SEEN.lock()
+                            .unwrap()
+                            .entry(n.term.clone())
+                            .insert_entry(n.class);
+                    });
 
                     // e-matching
                     let adds = nodes.filter(|n| match n.term {
@@ -165,8 +170,7 @@ fn main() {
                         .concat(&assoc_lr_rewrites);
 
                     let new_nodes = rewrites
-                        .map(|(c, n)| created_terms(&n, Some(c)))
-                        .flat_map(|x| x)
+                        .flat_map(|(c, n)| created_terms(&n, Some(c)))
                         .map(|(t, c)| Node { term: t, class: c });
 
                     let nodes = nodes.concat(&new_nodes).distinct();
@@ -188,7 +192,8 @@ fn main() {
                                         (*child, *grandparent)
                                     })
                                     .distinct()
-                            });
+                            })
+                            .arrange_by_key();
                         // .inspect(|x| println!("collapsed {:?}", x));
 
                         // rebuild e-graph
@@ -196,9 +201,11 @@ fn main() {
                         // - update term classes
                         let nodes = nodes
                             .map(|n| (n.class, n))
-                            .join_map(&repr, |_, n, c| Node {
-                                term: n.term.clone(),
-                                class: *c,
+                            .join_core(&repr, |_, n, c| {
+                                Some(Node {
+                                    term: n.term.clone(),
+                                    class: *c,
+                                })
                             })
                             .distinct();
 
@@ -209,7 +216,7 @@ fn main() {
                                     (get_in_term(&n.term, i).unwrap(), (n.clone(), i))
                                 })
                             })
-                            .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
+                            .join_core(&repr, |_, (n, i), c| Some((n.clone(), (*i, *c))))
                             .reduce(|n, input, output| {
                                 let mut t = n.term.clone();
                                 for ((i, c), _) in input {
