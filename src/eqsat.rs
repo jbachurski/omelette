@@ -76,8 +76,6 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
 
     timely::execute_from_args(std::env::args(), move |worker| {
         let mut inits = worker.dataflow(|scope| {
-            // let init_terms = terms_for_init.into_iter().to_stream(scope);
-            // let (mut nodes_input, init_nodes) = scope.new_collection();
             let (init_terms_input, init_terms) = scope.new_collection();
 
             let final_nodes: Collection<_, Node> = init_terms
@@ -92,12 +90,16 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                             .insert_entry(n.class);
                     });
 
-                    // e-matching
+                    // --- === e-matching === ---
+                    // Each rule has to be implemented separately
+                    // - this could be fixed with a code generation approach,
+                    //   but I believe they can't be constructed dynamically.
                     let adds = nodes.filter(|n| match n.term {
                         Add(_, _) => true,
                         _ => false,
                     });
 
+                    // Associativity right-to-left [a + (b + c) => (a + b) + c]
                     let assoc_rl_rewrites = adds
                         .map(|abc| {
                             (
@@ -124,6 +126,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                             )
                         });
 
+                    // Associativity left-to-right [(a + b) + c => a + (b + c)]
                     let assoc_lr_rewrites = adds
                         .map(|abc| {
                             (
@@ -150,6 +153,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                             )
                         });
 
+                    // Commutativity [a + b => b + a]
                     let comm_rewrites = adds.map(|n| {
                         (
                             n.class,
@@ -160,7 +164,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                         )
                     });
 
-                    // collect rewrites, expand e-graph
+                    // === collect rewrites ===
                     let rewrites = comm_rewrites
                         .concat(&assoc_rl_rewrites)
                         .concat(&assoc_lr_rewrites);
@@ -171,8 +175,16 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
 
                     let nodes = nodes.concat(&new_nodes).distinct();
 
+                    // --- === e-graph rebuilding === ---
+                    // we run this in a fixed-point to ensure the e-graph is fully rebuilt
+                    // before the next iteration - otherwise we get surprising blow-ups
+                    // or saturation does not happen at all
                     nodes.iterate(|nodes| {
-                        // collapse e-classes
+                        // === collapse e-classes ===
+                        // For all terms, if we can determine it could be assigned
+                        // two e-classes, then those e-classes must be the same and can be unified.
+                        // We pick the e-class with the minimum identifier (earliest)
+                        // as the representative for them.
                         let repr = nodes
                             .map(|n| (n.term, n.class))
                             .reduce(|_key, input, output| {
@@ -192,8 +204,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                             .arrange_by_key();
                         // .inspect(|x| println!("collapsed {:?}", x));
 
-                        // rebuild e-graph
-
+                        // update terms
                         // - update term classes
                         let nodes = nodes
                             .map(|n| (n.class, n))
@@ -206,6 +217,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                             .distinct();
 
                         // - update subterm classes: nodes must be a set at this point!
+                        // this part is rather tricky and inefficient
                         let updates = nodes
                             .flat_map(|n| {
                                 (0..arity_term(&n.term)).map(move |i| {
@@ -227,6 +239,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
                                 ))
                             });
 
+                        // this is a bit weird
                         let nodes = nodes
                             .concat(&updates.map(|(_old, new)| new))
                             .concat(&updates.map(|(old, _new)| old).negate());
@@ -245,6 +258,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
 
         inits.advance_to(0);
 
+        // insert the initial term
         for (t, c) in created_terms(&to_new_term(&initial_term), None) {
             inits.insert((t, c));
         }
@@ -253,6 +267,7 @@ pub fn saturate(initial_term: TTerm) -> Vec<Node> {
     })
     .expect("Computation terminated abnormally");
 
+    // unwrap all the e-nodes - there's only one computation time (0)
     recv.extract()
         .into_iter()
         .flat_map(|(_time, c)| {
