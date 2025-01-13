@@ -34,14 +34,12 @@ fn to_new_term(t: &TTerm) -> NewTerm {
     NewTerm::Create(Box::new(map_term(t, &|t| to_new_term(t))))
 }
 
+use once_cell::sync::Lazy;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 fn collect_created_terms(t: &NewTerm, v: &RefCell<Vec<(Term<Class>, Class)>>) -> Class {
-    use once_cell::sync::Lazy;
-    use std::{collections::HashMap, sync::Mutex};
-
     // hash cons table
     static SEEN: Lazy<Mutex<HashMap<Term<Class>, Class>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
@@ -189,44 +187,43 @@ fn main() {
                                     })
                                     .distinct()
                             });
-                        // .inspect(|x| println!("collapsed {:?}", x));
+
+                        static PAR: Lazy<Mutex<HashMap<Class, Class>>> =
+                            Lazy::new(|| Mutex::new(HashMap::new()));
+
+                        fn par(h: &HashMap<Class, Class>, c: Class) -> Class {
+                            return *h.get(&c).unwrap_or(&c);
+                        }
+
+                        let marker =
+                            repr.consolidate()
+                                .map(|x| ((), x))
+                                .reduce(|(), input, output| {
+                                    let mut par = PAR.lock().unwrap();
+                                    for ((child, parent), _) in input {
+                                        par.entry(*child).insert_entry(*parent);
+                                    }
+                                    output.push((next_class(), 1));
+                                });
 
                         // rebuild e-graph
 
-                        // - update term classes
                         let nodes = nodes
-                            .map(|n| (n.class, n))
-                            .join_map(&repr, |_, n, c| Node {
-                                term: n.term.clone(),
-                                class: *c,
-                            })
-                            .distinct();
-
-                        // - update subterm classes: nodes must be a set at this point!
-                        let updates = nodes
-                            .flat_map(|n| {
-                                (0..arity_term(&n.term)).map(move |i| {
-                                    (get_in_term(&n.term, i).unwrap(), (n.clone(), i))
-                                })
-                            })
-                            .join_map(&repr, |_, (n, i), c| (n.clone(), (*i, *c)))
-                            .reduce(|n, input, output| {
-                                let mut t = n.term.clone();
-                                for ((i, c), _) in input {
-                                    t = set_in_term(&t, *i, *c).unwrap();
+                            .map(|n| ((), n))
+                            .join_map(&marker, |(), n, _| ((), n.clone()))
+                            .reduce(|(), input, output| {
+                                let pr = PAR.lock().unwrap();
+                                for (n, _) in input {
+                                    output.push((
+                                        Node {
+                                            term: map_term(&n.term, &|c| par(&pr, *c)),
+                                            class: par(&pr, n.class),
+                                        },
+                                        1,
+                                    ));
                                 }
-                                output.push((
-                                    Node {
-                                        term: t,
-                                        class: n.class,
-                                    },
-                                    1,
-                                ))
-                            });
-
-                        let nodes = nodes
-                            .concat(&updates.map(|(_old, new)| new))
-                            .concat(&updates.map(|(old, _new)| old).negate());
+                            })
+                            .map(|((), n)| n);
 
                         nodes.distinct()
                     })
