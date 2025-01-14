@@ -16,5 +16,5 @@ fn main() {
     let classes: HashSet<Class> = nodes.iter().map(|n| n.class).collect();
 
     println!("{} classes, {} nodes", classes.len(), nodes.len());
-    println!("{:?}\tdone", timer.elapsed());
+    println!("{:?}", timer.elapsed());
 }
